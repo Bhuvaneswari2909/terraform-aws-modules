@@ -5,19 +5,16 @@ on:
   push:
     branches:
       - main
-    paths:
-      - "modules/**"
 
   workflow_dispatch:
     inputs:
       module:
-        description: "Module name or all"
+        description: "Module folder name or all"
         required: true
         default: "all"
         type: string
-
       version_bump:
-        description: "Version bump type"
+        description: "Version increment"
         required: true
         default: "patch"
         type: choice
@@ -51,42 +48,10 @@ jobs:
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Debug Git configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Event: ${{ github.event_name }}"
-          echo "Current SHA: ${{ github.sha }}"
-          echo "Previous SHA: ${{ github.event.before }}"
-
-          echo "Git status:"
-          git status
-
-          echo "Git remotes:"
-          git remote -v
-
-          echo "Recent commits:"
-          git log -3 --oneline
-
-          echo "Existing tags:"
-          git tag --list
-
-          echo "Module directories:"
-          if [[ -d modules ]]; then
-            find modules -maxdepth 2 -type d
-          else
-            echo "ERROR: modules/ directory not found"
-            exit 1
-          fi
-
       - name: Fetch tags
-        shell: bash
-        run: |
-          set -euo pipefail
-          git fetch --tags origin
+        run: git fetch --tags origin
 
-      - name: Detect modules
+      - name: Detect Terraform modules
         id: detect
         shell: bash
         env:
@@ -97,23 +62,30 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Discover root-level Terraform module folders
+          find . -mindepth 1 -maxdepth 1 -type d \
+            ! -name ".git" \
+            ! -name ".github" \
+            -printf '%f\n' |
+          while IFS= read -r DIR; do
+            if find "$DIR" -maxdepth 1 \
+              -name "*.tf" -type f | grep -q .; then
+              echo "$DIR"
+            fi
+          done | sort -u > all_modules.txt
+
+          echo "Discovered Terraform modules:"
+          cat all_modules.txt
+
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
 
-            echo "Manual workflow triggered"
-
             if [[ "$INPUT_MODULE" == "all" ]]; then
-              find modules -mindepth 1 -maxdepth 1 \
-                -type d -printf '%f\n' |
-                sort > changed_modules.txt
+              cp all_modules.txt changed_modules.txt
             else
-              if [[ "$INPUT_MODULE" == *"/"* ]] ||
-                 [[ "$INPUT_MODULE" == "." ]] ||
-                 [[ "$INPUT_MODULE" == ".." ]] ||
-                 [[ ! -d "modules/$INPUT_MODULE" ]]; then
-                echo "ERROR: Invalid module: $INPUT_MODULE"
+              if ! grep -Fxq "$INPUT_MODULE" all_modules.txt; then
+                echo "ERROR: Module not found: $INPUT_MODULE"
                 exit 1
               fi
-
               printf '%s\n' "$INPUT_MODULE" \
                 > changed_modules.txt
             fi
@@ -121,38 +93,24 @@ jobs:
           elif [[ -z "$BEFORE_SHA" ]] ||
                [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
 
-            echo "No previous SHA. Selecting all modules."
-
-            find modules -mindepth 1 -maxdepth 1 \
-              -type d -printf '%f\n' |
-              sort > changed_modules.txt
+            echo "Initial push. Selecting all modules."
+            cp all_modules.txt changed_modules.txt
 
           else
+            # Find the modules changed in this push
+            git diff --name-only \
+              "$BEFORE_SHA" "$AFTER_SHA" |
+              awk -F/ 'NF >= 2 {print $1}' |
+              sort -u > modified_dirs.txt
 
-            echo "Detecting changes between:"
-            echo "$BEFORE_SHA"
-            echo "$AFTER_SHA"
-
-            if ! git cat-file -e "${BEFORE_SHA}^{commit}"; then
-              echo "Previous commit unavailable"
-              echo "Selecting all modules"
-
-              find modules -mindepth 1 -maxdepth 1 \
-                -type d -printf '%f\n' |
-                sort > changed_modules.txt
-            else
-              git diff --name-only \
-                "$BEFORE_SHA" "$AFTER_SHA" -- modules/ |
-                awk -F/ 'NF >= 3 {print $2}' |
-                sort -u > changed_modules.txt
-            fi
-
+            grep -Fxf all_modules.txt modified_dirs.txt \
+              > changed_modules.txt || true
           fi
 
-          echo "Selected modules:"
+          echo "Modules to tag:"
           cat changed_modules.txt
 
-      - name: Create module tags
+      - name: Create and push module tags
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -164,21 +122,20 @@ jobs:
             VERSION_BUMP="patch"
           fi
 
-          while IFS= read -r MODULE; do
+          if [[ ! -s changed_modules.txt ]]; then
+            echo "No Terraform module changes detected."
+            exit 0
+          fi
 
+          while IFS= read -r MODULE; do
             [[ -z "$MODULE" ]] && continue
 
-            if [[ ! -d "modules/$MODULE" ]]; then
-              echo "Skipping deleted module: $MODULE"
-              continue
-            fi
-
-            echo "================================"
+            echo "--------------------------------"
             echo "Processing module: $MODULE"
 
             PREFIX="${MODULE}/v"
 
-            # Find the highest existing semantic version
+            # Get highest semantic version for this module
             LATEST_VERSION=""
 
             while IFS= read -r TAG; do
@@ -214,7 +171,7 @@ jobs:
                   PATCH=$((PATCH + 1))
                   ;;
                 *)
-                  echo "ERROR: Invalid version bump"
+                  echo "Invalid version bump"
                   exit 1
                   ;;
               esac
@@ -224,9 +181,7 @@ jobs:
 
             NEW_TAG="${PREFIX}${NEW_VERSION}"
 
-            echo "Previous version: ${LATEST_VERSION:-none}"
-            echo "New version: $NEW_VERSION"
-            echo "Creating tag: $NEW_TAG"
+            echo "Creating Git tag: $NEW_TAG"
 
             if git rev-parse -q --verify \
               "refs/tags/$NEW_TAG" >/dev/null; then
@@ -237,28 +192,20 @@ jobs:
             git tag -a "$NEW_TAG" \
               -m "Release $MODULE version $NEW_VERSION"
 
-            if ! git push origin "refs/tags/$NEW_TAG"; then
-              echo "ERROR: Failed to push tag $NEW_TAG"
-              echo "Check GitHub Actions write permissions"
-              exit 1
-            fi
+            git push origin "refs/tags/$NEW_TAG"
 
-            echo "Successfully pushed $NEW_TAG"
+            echo "Successfully pushed: $NEW_TAG"
 
           done < changed_modules.txt
 
       - name: Workflow summary
-        if: success()
+        if: always()
         shell: bash
         run: |
           echo "## Terraform Module Tagging" \
             >> "$GITHUB_STEP_SUMMARY"
 
-          echo "Tagging completed successfully." \
-            >> "$GITHUB_STEP_SUMMARY"
-
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "### Current module tags" \
+          echo "### Existing Git tags" \
             >> "$GITHUB_STEP_SUMMARY"
 
           git tag --list | sort -V \
