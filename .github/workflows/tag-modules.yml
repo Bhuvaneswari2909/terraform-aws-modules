@@ -1,5 +1,5 @@
 
-name: Tag Terraform Modules
+name: Terraform Module Tagging
 
 on:
   push:
@@ -7,18 +7,35 @@ on:
       - main
     paths:
       - "modules/**"
+
   workflow_dispatch:
     inputs:
       module:
-        description: "Terraform module name"
+        description: "Module name or all"
         required: true
         default: "all"
         type: string
+
+      version_bump:
+        description: "Version bump type"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
 permissions:
   contents: write
 
+concurrency:
+  group: terraform-module-tagging
+  cancel-in-progress: false
+
 jobs:
   tag-modules:
+    name: Tag Terraform Modules
     runs-on: ubuntu-latest
 
     steps:
@@ -28,49 +45,221 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Detect changed modules and tag
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Debug Git configuration
         shell: bash
         run: |
           set -euo pipefail
 
-          BEFORE="${{ github.event.before }}"
-          AFTER="${{ github.sha }}"
+          echo "Event: ${{ github.event_name }}"
+          echo "Current SHA: ${{ github.sha }}"
+          echo "Previous SHA: ${{ github.event.before }}"
 
-          if [[ "$BEFORE" =~ ^0+$ ]]; then
-            echo "No previous commit to compare"
-            exit 0
+          echo "Git status:"
+          git status
+
+          echo "Git remotes:"
+          git remote -v
+
+          echo "Recent commits:"
+          git log -3 --oneline
+
+          echo "Existing tags:"
+          git tag --list
+
+          echo "Module directories:"
+          if [[ -d modules ]]; then
+            find modules -maxdepth 2 -type d
+          else
+            echo "ERROR: modules/ directory not found"
+            exit 1
           fi
 
-          git diff --name-only "$BEFORE" "$AFTER" |
-            awk -F/ '$1=="modules" && NF>=3 {print $2}' |
-            sort -u > changed_modules.txt
+      - name: Fetch tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+
+      - name: Detect modules
+        id: detect
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          INPUT_MODULE: ${{ inputs.module }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+
+            echo "Manual workflow triggered"
+
+            if [[ "$INPUT_MODULE" == "all" ]]; then
+              find modules -mindepth 1 -maxdepth 1 \
+                -type d -printf '%f\n' |
+                sort > changed_modules.txt
+            else
+              if [[ "$INPUT_MODULE" == *"/"* ]] ||
+                 [[ "$INPUT_MODULE" == "." ]] ||
+                 [[ "$INPUT_MODULE" == ".." ]] ||
+                 [[ ! -d "modules/$INPUT_MODULE" ]]; then
+                echo "ERROR: Invalid module: $INPUT_MODULE"
+                exit 1
+              fi
+
+              printf '%s\n' "$INPUT_MODULE" \
+                > changed_modules.txt
+            fi
+
+          elif [[ -z "$BEFORE_SHA" ]] ||
+               [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+
+            echo "No previous SHA. Selecting all modules."
+
+            find modules -mindepth 1 -maxdepth 1 \
+              -type d -printf '%f\n' |
+              sort > changed_modules.txt
+
+          else
+
+            echo "Detecting changes between:"
+            echo "$BEFORE_SHA"
+            echo "$AFTER_SHA"
+
+            if ! git cat-file -e "${BEFORE_SHA}^{commit}"; then
+              echo "Previous commit unavailable"
+              echo "Selecting all modules"
+
+              find modules -mindepth 1 -maxdepth 1 \
+                -type d -printf '%f\n' |
+                sort > changed_modules.txt
+            else
+              git diff --name-only \
+                "$BEFORE_SHA" "$AFTER_SHA" -- modules/ |
+                awk -F/ 'NF >= 3 {print $2}' |
+                sort -u > changed_modules.txt
+            fi
+
+          fi
+
+          echo "Selected modules:"
+          cat changed_modules.txt
+
+      - name: Create module tags
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          VERSION_BUMP: ${{ inputs.version_bump }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
+            VERSION_BUMP="patch"
+          fi
 
           while IFS= read -r MODULE; do
-            [[ -z "$MODULE" ]] && continue
-            [[ -d "modules/$MODULE" ]] || continue
 
+            [[ -z "$MODULE" ]] && continue
+
+            if [[ ! -d "modules/$MODULE" ]]; then
+              echo "Skipping deleted module: $MODULE"
+              continue
+            fi
+
+            echo "================================"
             echo "Processing module: $MODULE"
 
             PREFIX="${MODULE}/v"
 
-            LATEST=$(git tag --list "${PREFIX}*" |
-              grep -E "^${MODULE}/v[0-9]+\.[0-9]+\.[0-9]+$" |
-              sort -V | tail -n 1 || true)
+            # Find the highest existing semantic version
+            LATEST_VERSION=""
 
-            if [[ -z "$LATEST" ]]; then
+            while IFS= read -r TAG; do
+              VERSION="${TAG#"$PREFIX"}"
+
+              if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                if [[ -z "$LATEST_VERSION" ]] ||
+                   [[ "$(printf '%s\n%s\n' \
+                     "$LATEST_VERSION" "$VERSION" |
+                     sort -V | tail -n 1)" == "$VERSION" ]]; then
+                  LATEST_VERSION="$VERSION"
+                fi
+              fi
+            done < <(git tag --list "${PREFIX}*")
+
+            if [[ -z "$LATEST_VERSION" ]]; then
               NEW_VERSION="1.0.0"
             else
-              VERSION="${LATEST#"$PREFIX"}"
-              IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
-              NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+              IFS='.' read -r MAJOR MINOR PATCH \
+                <<< "$LATEST_VERSION"
+
+              case "$VERSION_BUMP" in
+                major)
+                  MAJOR=$((MAJOR + 1))
+                  MINOR=0
+                  PATCH=0
+                  ;;
+                minor)
+                  MINOR=$((MINOR + 1))
+                  PATCH=0
+                  ;;
+                patch)
+                  PATCH=$((PATCH + 1))
+                  ;;
+                *)
+                  echo "ERROR: Invalid version bump"
+                  exit 1
+                  ;;
+              esac
+
+              NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
             fi
 
             NEW_TAG="${PREFIX}${NEW_VERSION}"
 
+            echo "Previous version: ${LATEST_VERSION:-none}"
+            echo "New version: $NEW_VERSION"
             echo "Creating tag: $NEW_TAG"
 
-            git tag "$NEW_TAG"
-            git push origin "$NEW_TAG"
+            if git rev-parse -q --verify \
+              "refs/tags/$NEW_TAG" >/dev/null; then
+              echo "ERROR: Tag already exists: $NEW_TAG"
+              exit 1
+            fi
+
+            git tag -a "$NEW_TAG" \
+              -m "Release $MODULE version $NEW_VERSION"
+
+            if ! git push origin "refs/tags/$NEW_TAG"; then
+              echo "ERROR: Failed to push tag $NEW_TAG"
+              echo "Check GitHub Actions write permissions"
+              exit 1
+            fi
+
+            echo "Successfully pushed $NEW_TAG"
 
           done < changed_modules.txt
 
+      - name: Workflow summary
+        if: success()
+        shell: bash
+        run: |
+          echo "## Terraform Module Tagging" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Tagging completed successfully." \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Current module tags" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          git tag --list | sort -V \
+            >> "$GITHUB_STEP_SUMMARY"
